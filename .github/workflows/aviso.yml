@@ -1,0 +1,33 @@
+name: Aviso de deploy revertido
+
+# Disparado pelo deploy seguro (gh workflow run aviso.yml -f motivo=...) depois de um rollback automático.
+# A issue é aberta pelo bot do GitHub, o que garante o e-mail para o dono (ações da própria conta não geram e-mail).
+
+on:
+  workflow_dispatch:
+    inputs:
+      motivo:
+        description: "Motivo curto, sem dados"
+        required: false
+        default: "smoke falhou"
+
+permissions:
+  issues: write
+
+jobs:
+  avisar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Abrir issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          MOTIVO: ${{ inputs.motivo }}
+        run: |
+          LIMPO="$(printf '%s' "$MOTIVO" | tr -cd 'a-zA-Z0-9 :;,()./-' | sed -E 's#https?://[^ ]*##g' | cut -c1-180)"
+          [ -n "$LIMPO" ] || LIMPO="smoke falhou"
+          QUANDO="$(TZ=America/Sao_Paulo date '+%d/%m/%Y %H:%M')"
+          printf 'Um deploy de producao falhou na conferencia e foi revertido automaticamente em %s (horario de Brasilia).\n\nMotivo: %s\n\nDetalhes na issue aberta no repositorio privado.\n' "$QUANDO" "$LIMPO" > "$RUNNER_TEMP/corpo.md"
+          gh issue create --title "Deploy revertido automaticamente" --body-file "$RUNNER_TEMP/corpo.md" > /dev/null
+          echo "aviso aberto"

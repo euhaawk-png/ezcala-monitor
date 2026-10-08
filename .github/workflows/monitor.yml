@@ -1,0 +1,93 @@
+name: Monitor
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write # só para o commit vazio que impede o GitHub de desligar o agendamento após 60 dias
+  issues: write
+
+concurrency:
+  group: monitor
+  cancel-in-progress: false
+
+env:
+  TITULO_AVISO: "Ezcala Resultados fora do ar"
+
+jobs:
+  verificar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Instalar Playwright (só Chromium)
+        run: |
+          npm install --no-audit --no-fund --no-package-lock --loglevel=error
+          npx playwright install --with-deps chromium > /dev/null
+
+      - name: Verificar
+        id: verificar
+        env:
+          MONITOR_EMAIL: ${{ secrets.MONITOR_EMAIL }}
+          MONITOR_PASSWORD: ${{ secrets.MONITOR_PASSWORD }}
+          MONITOR_SECRET: ${{ secrets.MONITOR_SECRET }}
+          MONITOR_URL: ${{ vars.MONITOR_URL }}
+          MONITOR_RESULT_FILE: ${{ runner.temp }}/motivo.txt
+        run: node check.mjs
+
+      - name: Abrir ou atualizar o aviso
+        if: failure() && steps.verificar.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          MOTIVO_ARQUIVO: ${{ runner.temp }}/motivo.txt
+          EXECUCAO: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          MOTIVO="$(cat "$MOTIVO_ARQUIVO" 2>/dev/null || true)"
+          [ -n "$MOTIVO" ] || MOTIVO="motivo nao registrado"
+          QUANDO="$(TZ=America/Sao_Paulo date '+%d/%m/%Y %H:%M')"
+          printf 'Falha detectada em %s (horario de Brasilia).\n\nMotivo: %s\n\nExecucao: %s\n' "$QUANDO" "$MOTIVO" "$EXECUCAO" > "$RUNNER_TEMP/corpo.md"
+          NUM="$(gh issue list --state open --limit 100 --json number,title --jq ".[] | select(.title == \"$TITULO_AVISO\") | .number" | head -n1)"
+          if [ -z "$NUM" ]; then
+            gh issue create --title "$TITULO_AVISO" --body-file "$RUNNER_TEMP/corpo.md" > /dev/null
+            echo "aviso aberto"
+          else
+            ULTIMO="$(gh issue view "$NUM" --json body,comments --jq '([.body] + [.comments[].body]) | last')"
+            if printf '%s' "$ULTIMO" | grep -qF "Motivo: $MOTIVO"; then
+              echo "aviso ja aberto com o mesmo motivo"
+            else
+              gh issue comment "$NUM" --body-file "$RUNNER_TEMP/corpo.md" > /dev/null
+              echo "aviso atualizado"
+            fi
+          fi
+
+      - name: Fechar o aviso
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          QUANDO="$(TZ=America/Sao_Paulo date '+%d/%m/%Y %H:%M')"
+          for NUM in $(gh issue list --state open --limit 100 --json number,title --jq ".[] | select(.title == \"$TITULO_AVISO\") | .number"); do
+            gh issue close "$NUM" --comment "Voltou ao ar em $QUANDO (horario de Brasilia)." > /dev/null
+            echo "aviso fechado"
+          done
+
+      - name: Manter o agendamento ativo
+        if: always() && github.event_name == 'schedule'
+        run: |
+          ULTIMO="$(git log -1 --format=%ct)"
+          DIAS=$(( ( $(date +%s) - ULTIMO ) / 86400 ))
+          if [ "$DIAS" -ge 45 ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "Manter o agendamento do monitor ativo" > /dev/null
+            git push > /dev/null 2>&1 && echo "agendamento renovado" || echo "nao consegui renovar o agendamento"
+          fi
