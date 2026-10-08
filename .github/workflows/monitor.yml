@@ -2,7 +2,7 @@ name: Monitor
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "4,19,34,49 * * * *" # minutos quebrados: o GitHub atrasa ou descarta agendamentos nos minutos cheios
   workflow_dispatch:
 
 permissions:
