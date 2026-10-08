@@ -1,0 +1,71 @@
+name: Teste diario de e-mail
+
+# Uma vez por dia (12:00 UTC = 9:00 de Brasilia), pede ao site um e-mail de checagem para o endereco de teste
+# do Resend e exige o evento "delivered". Nao precisa de navegador. O log mostra so "ok" ou "falhou: motivo".
+
+on:
+  schedule:
+    - cron: "0 12 * * *"
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+concurrency:
+  group: email-diario
+  cancel-in-progress: false
+
+env:
+  TITULO_AVISO: "Envio de e-mail do Ezcala Resultados falhou"
+
+jobs:
+  email_diario:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Enviar e conferir
+        id: verificar
+        env:
+          MONITOR_SECRET: ${{ secrets.MONITOR_SECRET }}
+          MONITOR_URL: ${{ vars.MONITOR_URL }}
+          MONITOR_RESULT_FILE: ${{ runner.temp }}/motivo.txt
+        run: node check.mjs email-diario
+
+      - name: Abrir ou atualizar o aviso
+        if: failure() && steps.verificar.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          MOTIVO_ARQUIVO: ${{ runner.temp }}/motivo.txt
+          EXECUCAO: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          MOTIVO="$(cat "$MOTIVO_ARQUIVO" 2>/dev/null || true)"
+          [ -n "$MOTIVO" ] || MOTIVO="motivo nao registrado"
+          QUANDO="$(TZ=America/Sao_Paulo date '+%d/%m/%Y %H:%M')"
+          printf 'Falha no teste diario de envio em %s (horario de Brasilia).\n\nMotivo: %s\n\nExecucao: %s\n' "$QUANDO" "$MOTIVO" "$EXECUCAO" > "$RUNNER_TEMP/corpo.md"
+          NUM="$(gh issue list --state open --limit 100 --json number,title --jq ".[] | select(.title == \"$TITULO_AVISO\") | .number" | head -n1)"
+          if [ -z "$NUM" ]; then
+            gh issue create --title "$TITULO_AVISO" --body-file "$RUNNER_TEMP/corpo.md" > /dev/null
+            echo "aviso aberto"
+          else
+            gh issue comment "$NUM" --body-file "$RUNNER_TEMP/corpo.md" > /dev/null
+            echo "aviso atualizado"
+          fi
+
+      - name: Fechar o aviso
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          QUANDO="$(TZ=America/Sao_Paulo date '+%d/%m/%Y %H:%M')"
+          for NUM in $(gh issue list --state open --limit 100 --json number,title --jq ".[] | select(.title == \"$TITULO_AVISO\") | .number"); do
+            gh issue close "$NUM" --comment "Envio voltou a funcionar em $QUANDO (horario de Brasilia)." > /dev/null
+            echo "aviso fechado"
+          done

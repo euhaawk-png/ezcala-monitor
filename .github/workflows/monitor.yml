@@ -39,6 +39,7 @@ jobs:
           MONITOR_PASSWORD: ${{ secrets.MONITOR_PASSWORD }}
           MONITOR_SECRET: ${{ secrets.MONITOR_SECRET }}
           MONITOR_URL: ${{ vars.MONITOR_URL }}
+          MONITOR_IGNORAR_EMAIL: ${{ vars.MONITOR_IGNORAR_EMAIL }}
           MONITOR_RESULT_FILE: ${{ runner.temp }}/motivo.txt
         run: node check.mjs
 

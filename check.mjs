@@ -1,11 +1,14 @@
 // Monitor do Ezcala Resultados (autocontido: só Node 22 e playwright).
 //
-// Confere a página inicial, a rota de saúde, duas rotas que devem dar 404 e o login do usuário de monitoramento.
+// Confere a página inicial, a rota de saúde (banco, master e e-mail), duas rotas que devem dar 404 e o login do
+// usuário de monitoramento. Com o argumento "email-diario", faz só o teste diário de envio: pede à rota
+// /api/saude/email um e-mail de checagem para o endereço de teste do Resend e exige o evento "delivered".
 // O log é público: imprime só "ok" ou "falhou: <motivos curtos sem dados>". Nunca imprime URL, e-mail nem segredo.
 //
 // Variáveis (Actions secrets): MONITOR_EMAIL, MONITOR_PASSWORD, MONITOR_SECRET.
 // Opcionais: MONITOR_URL (variável do repositório), MONITOR_NOME, MONITOR_RESULT_FILE (onde gravar o motivo),
-// MONITOR_DETALHADO=1 (uma linha por verificação, formato "ok: ..." / "falhou: ...", para uso local).
+// MONITOR_DETALHADO=1 (uma linha por verificação, formato "ok: ..." / "falhou: ...", para uso local),
+// MONITOR_IGNORAR_EMAIL=1 (não confere o campo email da saúde; só enquanto o Resend não estiver configurado).
 
 import { realpathSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -15,6 +18,10 @@ const NOME_PADRAO = "Monitoramento Ezcala";
 const UA_MARK = "EzrMonitor/1";
 const TIMEOUT_HTTP_MS = 20_000;
 const TIMEOUT_LOGIN_MS = 45_000;
+// A rota espera até 30 s pelo evento de entrega, mais o envio.
+const TIMEOUT_EMAIL_MS = 75_000;
+// Endereço público de teste do Resend: aceita o envio e gera o evento "delivered" sem entregar a ninguém.
+export const DESTINO_TESTE = "delivered@resend.dev";
 
 function envOf(name) {
   const v = (process.env[name] ?? "").trim();
@@ -29,6 +36,7 @@ export function config(env = process.env) {
     password: env.MONITOR_PASSWORD ? env.MONITOR_PASSWORD : undefined,
     secret: get("MONITOR_SECRET"),
     nome: get("MONITOR_NOME") ?? NOME_PADRAO,
+    ignorarEmail: get("MONITOR_IGNORAR_EMAIL") === "1",
   };
 }
 
@@ -55,6 +63,20 @@ export function motivoSaude(corpo) {
   return p.length ? `saude: ${p.join(", ")}` : null;
 }
 
+/** Campo email de /api/saude: só "ok" passa. */
+export function motivoEmail(corpo) {
+  if (!corpo || typeof corpo !== "object") return "email: saude sem JSON";
+  return corpo.email === "ok" ? null : `email ${valorCurto(corpo.email)}`;
+}
+
+/** Resposta de POST /api/saude/email?acao=enviar-teste: só passa com 200 e último evento "delivered". */
+export function motivoEnvioTeste(status, corpo) {
+  if (!corpo || typeof corpo !== "object") return `email teste respondeu ${status}`;
+  if (status !== 200) return `email teste respondeu ${status}${corpo.erro ? ` (${valorCurto(corpo.erro)})` : ""}`;
+  if (corpo.ultimo_evento !== "delivered") return `email teste: ultimo evento ${corpo.ultimo_evento == null ? "nenhum" : valorCurto(corpo.ultimo_evento)}`;
+  return null;
+}
+
 function temFormularioLogin(html) {
   return /name=["']?email["']?/i.test(html) && /(type|name)=["']?password["']?/i.test(html);
 }
@@ -79,24 +101,56 @@ async function checarInicio(cfg) {
   }
 }
 
+/** Saúde (banco e master) e, numa linha separada, o campo email. */
 async function checarSaude(cfg) {
-  if (!cfg.secret) return { ok: false, texto: "saude: segredo ausente" };
+  if (!cfg.secret) return [{ ok: false, texto: "saude: segredo ausente" }];
+  let r;
+  let corpo = null;
   try {
-    const r = await pegar(cfg, "/api/saude", { authorization: `Bearer ${cfg.secret}`, accept: "application/json" });
+    r = await pegar(cfg, "/api/saude", { authorization: `Bearer ${cfg.secret}`, accept: "application/json" });
+    try {
+      corpo = await r.json();
+    } catch {
+      corpo = null;
+    }
+  } catch {
+    return [{ ok: false, texto: "saude fora do ar" }];
+  }
+  let saude;
+  if (r.status !== 200) {
+    const d = corpo ? motivoSaude(corpo) : null;
+    saude = { ok: false, texto: `saude respondeu ${r.status}${d ? ` (${d.replace(/^saude: /, "")})` : ""}` };
+  } else {
+    const m = motivoSaude(corpo);
+    saude = m ? { ok: false, texto: m } : { ok: true, texto: "saude" };
+  }
+  if (cfg.ignorarEmail || !corpo || typeof corpo !== "object") return [saude];
+  const e = motivoEmail(corpo);
+  return [saude, e ? { ok: false, texto: e } : { ok: true, texto: "email" }];
+}
+
+/** Teste diário: um envio real para o endereço de teste do Resend, exigindo o evento "delivered". */
+export async function verificarEmailDiario(cfg) {
+  if (!cfg.secret) return [{ ok: false, texto: "email teste: segredo ausente" }];
+  const caminho = `/api/saude/email?acao=enviar-teste&para=${encodeURIComponent(DESTINO_TESTE)}`;
+  try {
+    const r = await fetch(new URL(caminho, cfg.baseUrl), {
+      method: "POST",
+      headers: { "user-agent": `Mozilla/5.0 ${UA_MARK}`, authorization: `Bearer ${cfg.secret}`, accept: "application/json" },
+      redirect: "manual",
+      cache: "no-store",
+      signal: AbortSignal.timeout(TIMEOUT_EMAIL_MS),
+    });
     let corpo = null;
     try {
       corpo = await r.json();
     } catch {
       corpo = null;
     }
-    if (r.status !== 200) {
-      const d = corpo ? motivoSaude(corpo) : null;
-      return { ok: false, texto: `saude respondeu ${r.status}${d ? ` (${d.replace(/^saude: /, "")})` : ""}` };
-    }
-    const m = motivoSaude(corpo);
-    return m ? { ok: false, texto: m } : { ok: true, texto: "saude" };
+    const m = motivoEnvioTeste(r.status, corpo);
+    return [m ? { ok: false, texto: m } : { ok: true, texto: "email teste entregue" }];
   } catch {
-    return { ok: false, texto: "saude fora do ar" };
+    return [{ ok: false, texto: "email teste sem resposta" }];
   }
 }
 
@@ -176,7 +230,7 @@ async function checarLogin(cfg) {
 export async function verificar(cfg) {
   const r = [];
   r.push(await checarInicio(cfg));
-  r.push(await checarSaude(cfg));
+  r.push(...(await checarSaude(cfg)));
   r.push(await checar404(cfg, "/admin"));
   r.push(await checar404(cfg, "/dashboard"));
   r.push(await checarLogin(cfg));
@@ -198,7 +252,7 @@ async function main() {
     return 1;
   }
   const segredos = [cfg.email, cfg.password, cfg.secret];
-  const resultados = await verificar(cfg);
+  const resultados = process.argv[2] === "email-diario" ? await verificarEmailDiario(cfg) : await verificar(cfg);
   if (envOf("MONITOR_DETALHADO") === "1") {
     for (const x of resultados) console.log(`${x.ok ? "ok" : "falhou"}: ${redigir(x.texto, segredos)}`);
     console.log(`resultado: ${resultados.every((x) => x.ok) ? "ok" : "falhou"}`);
